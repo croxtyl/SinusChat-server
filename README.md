@@ -25,6 +25,20 @@ node server.js
 
 Przy starcie serwer sam dopisuje brakujące kolumny i tabele. Zmienne środowiskowe ustaw w usłudze systemd albo w pliku `.env` (wzór: [.env.example](.env.example)). Nie dodawaj prawdziwych wartości do repozytorium.
 
+## Struktura kodu
+
+| Ścieżka | Zawartość |
+|---|---|
+| `server.js` | punkt wejścia: schemat bazy, zadania okresowe, start serwera |
+| `src/app.js` | aplikacja Fastify: wtyczki, hooki, lista routerów |
+| `src/routes/` | po jednym pliku na obszar: trasy razem z ich logiką, także WebSocket (`ws.js`) i `requireAuth` (`auth.js`) |
+| `src/common.js` | to, z czego korzysta wiele routerów: uprawnienia, połączenia WebSocket, limity, walidacja |
+| `src/crypto.js` | jedyne miejsce używające modułu `crypto` |
+| `src/db.js` | pula połączeń i zmiany schematu przy starcie |
+| `src/config.js`, `src/jobs.js` | zmienne środowiskowe i zadania okresowe |
+
+Trasa dla zalogowanych dostaje `{ preHandler: requireAuth }`, a dane z tokenu czyta z `req.auth`.
+
 ## Zmienne środowiskowe
 
 | Zmienna | Wymagana | Do czego służy |

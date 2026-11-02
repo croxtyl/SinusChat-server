@@ -1,0 +1,372 @@
+// SinusChat — serwer. Copyright © 2026 Sinusoide Technology. SPDX-License-Identifier: AGPL-3.0-only
+
+'use strict'
+
+const { hashAccessKey, keyFingerprint, randomUuid, sameHex } = require('../crypto')
+const { db } = require('../db')
+const {
+  canonicalPair, canUseConversation, DAY_MS, DIRECT_TARGET_LIMIT, groupAllows, isBlockedBy,
+  isGroupId, isHash, isParticipant, lookupAllowed, membership, MESSAGE_MAX_BYTES,
+  otherMemberHashes, otherParty, perMinute, SEALED_BUDGET_BYTES, SEALED_MAX_B64, sealedFlood,
+  SENDER_BUDGET_BYTES, sendToUser, spendBudget, userExists
+} = require('../common')
+const { requireAuth } = require('./auth')
+const { touchGroupDay } = require('./presence')
+const { wakeUser } = require('./push')
+
+const MESSAGE_TTL_MS = DAY_MS
+const NOTIFIABLE_KINDS = new Set(['msg', 'group_attach'])
+const ADDRESSED_GROUP_KINDS = new Set(['group_key', 'group_key_request'])
+const QUEUED_ACKS = `kind='ack' AND sender_hash=$1 AND recipient_hash=$2
+  AND conversation_id=$3 AND delivered_at IS NULL`
+const CONTENT_KINDS = new Set(['msg', 'group_attach'])
+const SEALED_ID_RE = /^[A-Za-z0-9_~.-]{1,100}$/
+const MAX_NOTIFIED_AUTHORS = 50
+
+function markDelivered(messageId, at) {
+  return db.query('UPDATE messages SET delivered_at=$1 WHERE id=$2', [at, messageId])
+}
+
+function baseMessageId(rowId) {
+  return String(rowId).replace(/_[0-9a-f]{16}$/, '')
+}
+
+function groupBySentMessage(expired) {
+  const sent = new Map()
+  for (const row of expired) {
+    if (!NOTIFIABLE_KINDS.has(row.kind)) continue
+    const isGroup = isGroupId(row.conversation_id)
+    const baseId = isGroup ? baseMessageId(row.id) : row.id
+    const key = `${row.conversation_id}|${row.sender_hash}|${baseId}`
+    const entry = sent.get(key)
+    if (entry) entry.missed++
+    else sent.set(key, {
+      conversationId: row.conversation_id, senderHash: row.sender_hash, baseId, isGroup, missed: 1
+    })
+  }
+  return sent
+}
+
+async function notifySenderOfExpiry({ conversationId, senderHash, baseId, isGroup, missed: expired }, now) {
+  let total = 1
+  if (isGroup) {
+    const { rows } = await db.query(
+      'SELECT COUNT(*)::int AS c FROM conversation_participants WHERE conversation_id=$1 AND user_hash!=$2',
+      [conversationId, senderHash]
+    )
+    total = rows[0]?.c ?? expired
+  }
+  const missed = Math.min(expired, total)
+  const delivered = Math.max(0, total - missed)
+
+  const noticeBody = Buffer.from(JSON.stringify({
+    originalId: baseId, conversationId, isGroup, total, delivered, missed, expiredAt: now
+  }), 'utf8')
+  const noticeId = `exp_${baseId}`
+
+  await db.query(
+    `INSERT INTO messages(id,conversation_id,sender_hash,recipient_hash,kind,payload,created_at)
+     VALUES($1,$2,$3,$4,'expiry_notice',$5,$6) ON CONFLICT(id) DO NOTHING`,
+    [noticeId, conversationId, senderHash, senderHash, noticeBody, now]
+  )
+
+  const live = sendToUser(senderHash, {
+    type: 'message', conversationId, id: noticeId, kind: 'expiry_notice',
+    payloadB64: noticeBody.toString('base64'), senderHash, createdAt: now
+  })
+  if (live) await markDelivered(noticeId, now)
+}
+
+async function purgeOldMessages() {
+  try {
+    const now = Date.now()
+    const { rows: expired } = await db.query(
+      `SELECT id, conversation_id, sender_hash, kind
+         FROM messages
+        WHERE delivered_at IS NULL AND created_at < $1::bigint
+        LIMIT 5000`,
+      [now - MESSAGE_TTL_MS]
+    )
+    if (!expired.length) return
+
+    const sent = groupBySentMessage(expired)
+    for (const message of sent.values()) {
+      try {
+        await notifySenderOfExpiry(message, now)
+      } catch (e) {
+        console.error('[PURGE] powiadomienie nadawcy nie powiodło się:', e.message)
+      }
+    }
+
+    const res = await db.query('DELETE FROM messages WHERE id = ANY($1::varchar[])', [expired.map(r => r.id)])
+    if (res.rowCount > 0) {
+      console.log(`[PURGE] usunięto ${res.rowCount} niedostarczonych, powiadomiono ${sent.size} nadawców`)
+    }
+  } catch (e) {
+    console.error('[PURGE] błąd czyszczenia:', e.message)
+  }
+}
+
+async function queueDirectAck(fromHash, toHash, conversationId, deliveredUpTo, readUpTo) {
+  const pair = [fromHash, toHash, conversationId]
+  let delivered = deliveredUpTo
+  let read = readUpTo
+  const { rows } = await db.query(`SELECT payload FROM messages WHERE ${QUEUED_ACKS}`, pair)
+  for (const row of rows) {
+    try {
+      const queued = JSON.parse(row.payload.toString('utf8'))
+      delivered = Math.max(delivered, Number(queued.deliveredUpTo) || 0)
+      read = Math.max(read, Number(queued.readUpTo) || 0)
+    } catch (_) {}
+  }
+  await db.query(`DELETE FROM messages WHERE ${QUEUED_ACKS}`, pair)
+  await db.query(
+    `INSERT INTO messages(id,conversation_id,sender_hash,recipient_hash,kind,payload,created_at)
+     VALUES($1,$2,$3,$4,'ack',$5,$6) ON CONFLICT(id) DO NOTHING`,
+    ['ack_' + randomUuid(), conversationId, fromHash, toHash,
+     Buffer.from(JSON.stringify({ deliveredUpTo: delivered, readUpTo: read }), 'utf8'), Date.now()])
+}
+
+async function relayDirectAck(fromHash, conversationId, deliveredUpTo, readUpTo) {
+  const delivered = Number(deliveredUpTo) || 0
+  const read = Number(readUpTo) || 0
+  if (!delivered && !read) return
+  const other = otherParty(conversationId, fromHash)
+  if (!other || other === fromHash) return
+  if (await isBlockedBy(fromHash, other)) return
+  const live = sendToUser(other, {
+    type: 'ack', conversationId, fromHash, deliveredUpTo: delivered || undefined, readUpTo: read || undefined
+  })
+  if (live || !(await userExists(other))) return
+  try {
+    await queueDirectAck(fromHash, other, conversationId, delivered, read)
+  } catch (_) {}
+}
+
+async function groupSendRefusal(conversationId, myHash, kind, recipientHash) {
+  if (!(await membership(conversationId, myHash))) {
+    return { status: 403, body: { error: 'Nie jesteś członkiem tej rozmowy' } }
+  }
+  if (ADDRESSED_GROUP_KINDS.has(kind) &&
+      !(recipientHash && await isParticipant(conversationId, String(recipientHash)))) {
+    return { status: 400, body: { error: 'Adresat nie należy do grupy' } }
+  }
+  if (CONTENT_KINDS.has(kind) && !(await groupAllows(conversationId, myHash, 'sendMessages'))) {
+    return { status: 403, body: { error: 'Nie można pisać na tej grupie', code: 'group_send_forbidden' } }
+  }
+  return null
+}
+
+async function directSendRefusal(conversationId, myHash, recipientHash) {
+  const recipient = String(recipientHash)
+  const pairOk = conversationId === canonicalPair(myHash, recipient) ||
+    ((await isParticipant(conversationId, myHash)) && (await isParticipant(conversationId, recipient)))
+  if (!pairOk) {
+    return { status: 403, body: { error: 'Nieprawidłowa rozmowa', code: 'conversation_mismatch' } }
+  }
+  if (!lookupAllowed('d', myHash, recipient, DIRECT_TARGET_LIMIT)) {
+    return { status: 429, body: { error: 'Za dużo nowych odbiorców — spróbuj jutro', code: 'too_many_recipients' } }
+  }
+  if (!(await userExists(recipient))) {
+    return { status: 410, body: { error: 'To konto zostało usunięte', code: 'account_deleted', deleted: recipient } }
+  }
+  if (await isBlockedBy(recipientHash, myHash)) {
+    return {
+      status: 403,
+      body: {
+        error: 'Nie można wysłać wiadomości do tego odbiorcy',
+        code: 'blocked_by_recipient',
+        blockedBy: recipientHash
+      }
+    }
+  }
+  return null
+}
+
+async function withoutBlockers(recipients, senderHash) {
+  if (!recipients.length) return recipients
+  const { rows } = await db.query(
+    'SELECT blocker_hash FROM blocked_users WHERE blocked_hash=$1 AND blocker_hash = ANY($2::text[])',
+    [senderHash, recipients]
+  ).catch(() => ({ rows: [] }))
+  const blockers = new Set(rows.map(r => r.blocker_hash))
+  return recipients.filter(h => !blockers.has(h))
+}
+
+async function groupRecipients(conversationId, myHash, kind, recipientHash) {
+  const recipients = ADDRESSED_GROUP_KINDS.has(kind)
+    ? [String(recipientHash)]
+    : await otherMemberHashes(conversationId, myHash)
+  return withoutBlockers(recipients, myHash)
+}
+
+function messageRoutes(app) {
+  app.get('/api/messages/waiting', { preHandler: requireAuth }, async (req) => {
+    const { rows } = await db.query(
+      `SELECT COUNT(*)::int AS n FROM messages
+        WHERE recipient_hash=$1 AND delivered_at IS NULL AND kind IN ('msg','group_attach','sealed')`,
+      [req.auth.sub])
+    return { count: rows[0]?.n || 0 }
+  })
+
+  app.get('/api/messages/pending', { preHandler: requireAuth }, async (req) => {
+    const { rows } = await db.query(
+      `SELECT id, conversation_id, sender_hash, kind, payload, created_at
+       FROM messages
+       WHERE recipient_hash = $1 AND delivered_at IS NULL
+       ORDER BY created_at ASC
+       LIMIT 500`,
+      [req.auth.sub]
+    )
+    if (!rows.length) return []
+
+    await db.query(
+      'UPDATE messages SET delivered_at=$1 WHERE id = ANY($2::varchar[])', [Date.now(), rows.map(r => r.id)])
+
+    return rows.map(r => ({
+      id: r.id,
+      conversationId: r.conversation_id,
+      senderHash: r.sender_hash,
+      kind: r.kind,
+      payloadB64: r.payload.toString('base64'),
+      createdAt: r.created_at
+    }))
+  })
+
+  app.post('/api/message', { preHandler: requireAuth }, async (req, reply) => {
+    const myHash = req.auth.sub
+    const { conversationId, messageId, payloadB64, recipientHash } = req.body || {}
+    if (!conversationId || !messageId || !payloadB64) return reply.code(400).send({ error: 'Brak danych' })
+
+    const kind = req.body.kind || 'msg'
+    const msgBytes = Buffer.from(payloadB64, 'base64')
+    const now = Date.now()
+    const isGroup = conversationId.startsWith('g_')
+    if (msgBytes.length > MESSAGE_MAX_BYTES) return reply.code(413).send({ error: 'Wiadomość za duża' })
+    if (kind === 'expiry_notice') return reply.code(400).send({ error: 'Nieprawidłowy rodzaj wiadomości' })
+    if (!isGroup && !recipientHash) return reply.code(400).send({ error: 'Brak recipientHash' })
+
+    const refusal = isGroup
+      ? await groupSendRefusal(conversationId, myHash, kind, recipientHash)
+      : await directSendRefusal(conversationId, myHash, recipientHash)
+    if (refusal) return reply.code(refusal.status).send(refusal.body)
+
+    if (isGroup) {
+      await db.query('INSERT INTO conversations(id) VALUES($1) ON CONFLICT DO NOTHING', [conversationId])
+      touchGroupDay(conversationId)
+    }
+
+    const recipients = isGroup
+      ? await groupRecipients(conversationId, myHash, kind, recipientHash)
+      : [recipientHash]
+
+    if (!spendBudget('s:' + myHash, msgBytes.length * Math.max(1, recipients.length), SENDER_BUDGET_BYTES)) {
+      return reply.code(429).send({ error: 'Za dużo danych w krótkim czasie — spróbuj później', code: 'queue_budget' })
+    }
+
+    let deliveredLive = false
+    for (const recipient of recipients) {
+      const rowId = isGroup ? `${messageId}_${recipient.slice(0, 16)}` : messageId
+      await db.query(
+        `INSERT INTO messages(id,conversation_id,sender_hash,recipient_hash,kind,payload,created_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO NOTHING`,
+        [rowId, conversationId, myHash, recipient, kind, msgBytes, now]
+      )
+
+      const live = sendToUser(recipient, {
+        type: 'message', conversationId, id: messageId, kind, payloadB64, senderHash: myHash, createdAt: now
+      })
+      if (live) {
+        deliveredLive = true
+        await markDelivered(rowId, now)
+      } else {
+        wakeUser(recipient, kind).catch(() => {})
+      }
+    }
+
+    return { ok: true, messageId, deliveredLive, createdAt: now }
+  })
+
+  app.post('/api/sealed', { config: perMinute(240) }, async (req, reply) => {
+    const { to, ak, id, payloadB64, ik } = req.body || {}
+    if (typeof to !== 'string' || !isHash(to) ||
+        typeof ak !== 'string' || ak.length > 64 ||
+        typeof id !== 'string' || !SEALED_ID_RE.test(id) ||
+        typeof payloadB64 !== 'string' || !payloadB64.length || payloadB64.length > SEALED_MAX_B64) {
+      return reply.code(400).send({ error: 'Brak danych' })
+    }
+
+    const { rows } = await db.query('SELECT ua_hash, e2e_public_key FROM users WHERE email_hash=$1', [to])
+    const expectedKey = rows[0]?.ua_hash
+    if (!expectedKey || !sameHex(expectedKey, hashAccessKey(ak))) {
+      return reply.code(401).send({ error: 'Brak dostępu', code: 'no_access' })
+    }
+    const publicKey = rows[0]?.e2e_public_key
+    if (typeof ik === 'string' && publicKey && keyFingerprint(publicKey) !== ik) {
+      return reply.code(409).send({ error: 'Nieaktualny klucz adresata', code: 'stale_key' })
+    }
+
+    const ephemeral = req.body.eph === true
+    if (sealedFlood(to)) return reply.code(429).send({ error: 'Za dużo wiadomości' })
+    if (!ephemeral && !spendBudget('r:' + to, payloadB64.length, SEALED_BUDGET_BYTES)) {
+      return reply.code(429).send({ error: 'Za dużo wiadomości' })
+    }
+
+    const now = Date.now()
+    const rowId = 's_' + id
+    if (ephemeral) {
+      sendToUser(to, { type: 'message', kind: 'sealed', eph: true, id: rowId, payloadB64, createdAt: now })
+      return { ok: true, createdAt: now }
+    }
+
+    const inserted = await db.query(
+      `INSERT INTO messages(id,conversation_id,sender_hash,recipient_hash,kind,payload,created_at)
+       VALUES($1,'',NULL,$2,'sealed',$3,$4) ON CONFLICT(id) DO NOTHING`,
+      [rowId, to, Buffer.from(payloadB64, 'base64'), now])
+    if (!inserted.rowCount) return { ok: true, messageId: id, createdAt: now }
+
+    const live = sendToUser(to, { type: 'message', kind: 'sealed', id: rowId, payloadB64, createdAt: now })
+    if (live) await markDelivered(rowId, now)
+    else wakeUser(to, 'msg').catch(() => {})
+    return { ok: true, messageId: id, deliveredLive: live, createdAt: now }
+  })
+
+  app.post('/api/sealed/ack', { preHandler: requireAuth }, async (req) => {
+    const ids = Array.isArray(req.body?.ids)
+      ? req.body.ids.filter(x => typeof x === 'string' && x.length <= 110).slice(0, 500)
+      : []
+    if (!ids.length) return { ok: true, deleted: 0 }
+    const { rowCount } = await db.query(
+      "DELETE FROM messages WHERE recipient_hash=$1 AND kind='sealed' AND id = ANY($2::varchar[])",
+      [req.auth.sub, ids])
+    return { ok: true, deleted: rowCount }
+  })
+
+  app.post('/api/ack', { preHandler: requireAuth }, async (req, reply) => {
+    const myHash = req.auth.sub
+    const { conversationId, deliveredUpTo, readUpTo, silentRead, noRelay } = req.body || {}
+    if (!conversationId) return reply.code(400).send({ error: 'Brak conversationId' })
+    if (!(await canUseConversation(conversationId, myHash))) {
+      return reply.code(403).send({ error: 'Brak dostępu do rozmowy' })
+    }
+
+    const deleted = deliveredUpTo && await db.query(
+      `DELETE FROM messages WHERE recipient_hash=$1 AND conversation_id=$2 AND created_at <= $3::bigint
+       RETURNING sender_hash`,
+      [myHash, conversationId, deliveredUpTo]
+    ).catch(() => null)
+
+    if (!noRelay && !isGroupId(conversationId)) {
+      await relayDirectAck(myHash, conversationId, deliveredUpTo, silentRead ? null : readUpTo)
+    } else if (!noRelay && deleted) {
+      const authors = new Set(deleted.rows.map(r => r.sender_hash).filter(h => h && h !== myHash))
+      for (const author of [...authors].slice(0, MAX_NOTIFIED_AUTHORS)) {
+        if (await isBlockedBy(myHash, author)) continue
+        sendToUser(author, { type: 'ack', conversationId, fromHash: myHash, deliveredUpTo })
+      }
+    }
+    return { ok: true, deliveredUpTo, readUpTo }
+  })
+}
+
+module.exports = { messageRoutes, MESSAGE_TTL_MS, purgeOldMessages, relayDirectAck }
