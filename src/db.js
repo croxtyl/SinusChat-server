@@ -1,14 +1,21 @@
 // SinusChat — serwer. Copyright © 2026 Sinusoide Technology. SPDX-License-Identifier: AGPL-3.0-only
 
-'use strict'
+"use strict";
 
-const pg = require('pg')
+const pg = require("pg");
 
-const { DB_URL } = require('./config')
-const { uploadHmacHex } = require('./crypto')
+const { DB_URL } = require("./config");
+const { uploadHmacHex } = require("./crypto");
 
-const db = new pg.Pool({ connectionString: DB_URL })
-db.on('error', (err) => console.error('[DB]', err.message))
+const db = new pg.Pool({
+  connectionString: DB_URL,
+  max: 20,
+  connectionTimeoutMillis: 10_000,
+  idleTimeoutMillis: 30_000,
+  statement_timeout: 60_000,
+  idle_in_transaction_session_timeout: 60_000,
+});
+db.on("error", (err) => console.error("[DB]", err.message));
 
 async function ensureSchema() {
   const stmts = [
@@ -37,6 +44,13 @@ async function ensureSchema() {
     `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS disappearing_trigger varchar(16) DEFAULT 'read'`,
     `CREATE INDEX IF NOT EXISTS idx_messages_undelivered
        ON messages (created_at) WHERE delivered_at IS NULL`,
+    `DROP INDEX IF EXISTS idx_messages_delivered`,
+    `DROP INDEX IF EXISTS idx_groups_id`,
+    `CREATE INDEX IF NOT EXISTS idx_messages_delivered_at
+       ON messages (delivered_at) WHERE delivered_at IS NOT NULL`,
+    `CREATE INDEX IF NOT EXISTS idx_messages_recipient_conversation
+       ON messages (recipient_hash, conversation_id, created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_blocked_users_blocked ON blocked_users (blocked_hash)`,
     `CREATE TABLE IF NOT EXISTS bug_reports (
        id           bigserial PRIMARY KEY,
        user_hash    varchar(64),
@@ -123,41 +137,42 @@ async function ensureSchema() {
     `UPDATE users SET last_active_day = ((extract(epoch from now()) * 1000)::bigint / 86400000)::integer
       WHERE last_active_day IS NULL`,
     `UPDATE users SET last_heartbeat_ms = 0, last_seen_ms = 0
-      WHERE COALESCE(last_heartbeat_ms,0) <> 0 OR COALESCE(last_seen_ms,0) <> 0`
-  ]
-  let failed = 0
+      WHERE COALESCE(last_heartbeat_ms,0) <> 0 OR COALESCE(last_seen_ms,0) <> 0`,
+  ];
+  let failed = 0;
   for (const sql of stmts) {
-    try { await db.query(sql) }
-    catch (e) {
-      failed++
-      console.error('[SCHEMA] BŁĄD:', e.message, '← przy:', sql.replace(/\s+/g, ' ').slice(0, 90))
+    try {
+      await db.query(sql);
+    } catch (e) {
+      failed++;
+      console.error("[SCHEMA] BŁĄD:", e.message, "← przy:", sql.replace(/\s+/g, " ").slice(0, 90));
     }
   }
   if (failed > 0) {
-    console.error(`[SCHEMA] ${failed} zmian(y) schematu NIE weszło. Najczęściej: użytkownik bazy ` +
-      'z DATABASE_URL nie jest właścicielem tabel. Uruchom migracja_sinuschat.sql jako postgres.')
+    console.error(
+      `[SCHEMA] ${failed} zmian(y) schematu NIE weszło. Najczęściej: użytkownik bazy ` +
+        "z DATABASE_URL nie jest właścicielem tabel. Uruchom migracja_sinuschat.sql jako postgres.",
+    );
   } else {
-    console.log('[SCHEMA] schemat aktualny')
+    console.log("[SCHEMA] schemat aktualny");
   }
 }
 
 async function migrateAvatarNames() {
   try {
-    const { rows } = await db.query(
-      `SELECT email_hash, avatar_url FROM users WHERE avatar_url ~ '/uploads/avatars/[0-9a-f]{64}[.]'`)
-    let moved = 0
+    const { rows } = await db.query(`SELECT email_hash, avatar_url FROM users WHERE avatar_url ~ '/uploads/avatars/[0-9a-f]{64}[.]'`);
+    let moved = 0;
     for (const { email_hash, avatar_url } of rows) {
-      const m = String(avatar_url).match(/\/uploads\/avatars\/([0-9a-f]{64})\.(jpg|png|webp)/)
-      if (!m) continue
-      const base = uploadHmacHex('avatar|' + m[1]).slice(0, 32)
-      await db.query('UPDATE users SET avatar_url=$1 WHERE email_hash=$2',
-        [avatar_url.replace(`${m[1]}.${m[2]}`, `${base}.${m[2]}`), email_hash])
-      moved++
+      const m = String(avatar_url).match(/\/uploads\/avatars\/([0-9a-f]{64})\.(jpg|png|webp)/);
+      if (!m) continue;
+      const base = uploadHmacHex("avatar|" + m[1]).slice(0, 32);
+      await db.query("UPDATE users SET avatar_url=$1 WHERE email_hash=$2", [avatar_url.replace(`${m[1]}.${m[2]}`, `${base}.${m[2]}`), email_hash]);
+      moved++;
     }
-    if (moved) console.log('[AVATAR] nowe nazwy zdjęć profilowych:', moved)
+    if (moved) console.log("[AVATAR] nowe nazwy zdjęć profilowych:", moved);
   } catch (e) {
-    console.error('[AVATAR] zmiana nazw nieudana:', e.message)
+    console.error("[AVATAR] zmiana nazw nieudana:", e.message);
   }
 }
 
-module.exports = { db, ensureSchema, migrateAvatarNames }
+module.exports = { db, ensureSchema, migrateAvatarNames };

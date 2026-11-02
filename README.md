@@ -8,12 +8,12 @@ Licencja: AGPL-3.0 z warunkami dodatkowymi, opisanymi w [NOTICE.md](NOTICE.md). 
 
 - Node.js 20 lub nowszy
 - PostgreSQL 17 lub nowszy
-- nginx przed serwerem: serwer słucha tylko na `127.0.0.1`, a nginx musi ustawiać nagłówek `X-Real-IP` (od niego zależą limity i lista IP panelu zgłoszeń)
+- nginx przed serwerem: serwer słucha tylko na `127.0.0.1`, a nginx musi nadpisywać nagłówek `X-Real-IP` adresem klienta (`proxy_set_header X-Real-IP $remote_addr;`). Serwer ufa temu nagłówkowi bez sprawdzania: bez nginx albo przy złej konfiguracji limity dla niezalogowanych i lista IP panelu zgłoszeń nie chronią
 - coturn z `use-auth-secret` i tym samym sekretem co `TURN_SECRET`
 - serwer plików PHP (`auth.php`, `upload.php`), z którym serwer dzieli sekrety `AUTH_PROOF_SECRET` i `UPLOAD_TOKEN_SECRET`
 - opcjonalnie własny ntfy i konto usługi Firebase
 
-Serwer trzyma stan rozmów i obecności w pamięci, więc działa jako jedna instancja. Głosówki zapisuje w `/opt/sinuschat/uploads/voice`. Adres serwera plików (`files.sinusoide.pl`) jest wpisany w kodzie: przy własnej instalacji trzeba go zmienić.
+Serwer trzyma stan rozmów i obecności w pamięci, więc działa jako jedna instancja. Głosówki zapisuje w `voice` wewnątrz `UPLOADS_DIR`. Adres serwera plików (`files.sinusoide.pl`) jest wpisany w kodzie: przy własnej instalacji trzeba go zmienić.
 
 ## Uruchomienie
 
@@ -27,35 +27,38 @@ Przy starcie serwer sam dopisuje brakujące kolumny i tabele. Zmienne środowisk
 
 ## Struktura kodu
 
-| Ścieżka | Zawartość |
-|---|---|
-| `server.js` | punkt wejścia: schemat bazy, zadania okresowe, start serwera |
-| `src/app.js` | aplikacja Fastify: wtyczki, hooki, lista routerów |
-| `src/routes/` | po jednym pliku na obszar: trasy razem z ich logiką, także WebSocket (`ws.js`) i `requireAuth` (`auth.js`) |
-| `src/common.js` | to, z czego korzysta wiele routerów: uprawnienia, połączenia WebSocket, limity, walidacja |
-| `src/crypto.js` | jedyne miejsce używające modułu `crypto` |
-| `src/db.js` | pula połączeń i zmiany schematu przy starcie |
-| `src/config.js`, `src/jobs.js` | zmienne środowiskowe i zadania okresowe |
+| Ścieżka                        | Zawartość                                                                                                  |
+| ------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `server.js`                    | punkt wejścia: schemat bazy, zadania okresowe, start serwera                                               |
+| `src/app.js`                   | aplikacja Fastify: wtyczki, hooki, lista routerów                                                          |
+| `src/routes/`                  | po jednym pliku na obszar: trasy razem z ich logiką, także WebSocket (`ws.js`) i `requireAuth` (`auth.js`) |
+| `src/common.js`                | to, z czego korzysta wiele routerów: uprawnienia, połączenia WebSocket, limity, walidacja                  |
+| `src/crypto.js`                | jedyne miejsce używające modułu `crypto`                                                                   |
+| `src/db.js`                    | pula połączeń i zmiany schematu przy starcie                                                               |
+| `src/config.js`, `src/jobs.js` | zmienne środowiskowe i zadania okresowe                                                                    |
 
 Trasa dla zalogowanych dostaje `{ preHandler: requireAuth }`, a dane z tokenu czyta z `req.auth`.
 
+Limity żądań liczą się na konto, gdy żądanie ma ważny token (600 na minutę), a w pozostałych przypadkach na adres IP (300 na minutę). Trasa może mieć własny limit: `config: perMinute(n)` albo `config: perHour(n)`.
+
 ## Zmienne środowiskowe
 
-| Zmienna | Wymagana | Do czego służy |
-|---|---|---|
-| `DATABASE_URL` | tak | adres bazy PostgreSQL |
-| `JWT_SECRET` | tak | podpis tokenów sesji |
-| `TURN_SECRET` | tak | wspólny sekret z coturn; z niego powstają godzinne hasła TURN |
-| `UPLOAD_TOKEN_SECRET` | tak | wspólny z `upload.php`: tokeny wysyłki plików, podpis przekaźnika dla Tora, kasowanie zdjęć profilowych |
-| `AUTH_PROOF_SECRET` | tak | wspólny z `auth.php`: kody z e-maila i dowody logowania; bez niego rejestracja i logowanie są zablokowane |
-| `REQUIRE_AUTH_PROOF` | nie (domyślnie `1`) | `0` wyłącza wymóg potwierdzenia e-maila, tylko do testów |
-| `PORT` | nie (domyślnie `3000`) | port na `127.0.0.1` |
-| `PUBLIC_API_URL` | nie | publiczny adres API, używany w linkach do głosówek |
-| `TURN_HOST` | nie | nazwa serwera TURN podawana aplikacji |
-| `NTFY_URL` | nie (domyślnie `https://ntfy.sh`) | serwer ntfy budzący telefony bez usług Google |
-| `FCM_SERVICE_ACCOUNT_FILE` | nie | ścieżka do pliku konta usługi Firebase; bez niego działa tylko ntfy |
-| `REPORTS_ADMIN_KEY` | nie | klucz panelu zgłoszeń, co najmniej 24 znaki; bez niego panel jest wyłączony |
-| `REPORTS_ADMIN_IPS` | nie | adresy IP oddzielone przecinkami, z których wolno wejść do panelu zgłoszeń |
+| Zmienna                    | Wymagana                                 | Do czego służy                                                                                            |
+| -------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`             | tak                                      | adres bazy PostgreSQL                                                                                     |
+| `JWT_SECRET`               | tak                                      | podpis tokenów sesji                                                                                      |
+| `TURN_SECRET`              | tak                                      | wspólny sekret z coturn; z niego powstają godzinne hasła TURN                                             |
+| `UPLOAD_TOKEN_SECRET`      | tak                                      | wspólny z `upload.php`: tokeny wysyłki plików, podpis przekaźnika dla Tora, kasowanie zdjęć profilowych   |
+| `AUTH_PROOF_SECRET`        | tak                                      | wspólny z `auth.php`: kody z e-maila i dowody logowania; bez niego rejestracja i logowanie są zablokowane |
+| `REQUIRE_AUTH_PROOF`       | nie (domyślnie `1`)                      | `0` wyłącza wymóg potwierdzenia e-maila, tylko do testów                                                  |
+| `PORT`                     | nie (domyślnie `3000`)                   | port na `127.0.0.1`                                                                                       |
+| `PUBLIC_API_URL`           | nie                                      | publiczny adres API, używany w linkach do głosówek                                                        |
+| `UPLOADS_DIR`              | nie (domyślnie `/opt/sinuschat/uploads`) | katalog na pliki serwera, w tym głosówki                                                                  |
+| `TURN_HOST`                | nie                                      | nazwa serwera TURN podawana aplikacji                                                                     |
+| `NTFY_URL`                 | nie (domyślnie `https://ntfy.sh`)        | serwer ntfy budzący telefony bez usług Google                                                             |
+| `FCM_SERVICE_ACCOUNT_FILE` | nie                                      | ścieżka do pliku konta usługi Firebase; bez niego działa tylko ntfy                                       |
+| `REPORTS_ADMIN_KEY`        | nie                                      | klucz panelu zgłoszeń, co najmniej 24 znaki; bez niego panel jest wyłączony                               |
+| `REPORTS_ADMIN_IPS`        | nie                                      | adresy IP oddzielone przecinkami, z których wolno wejść do panelu zgłoszeń                                |
 
 ## English
 

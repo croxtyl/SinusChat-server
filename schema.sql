@@ -220,6 +220,8 @@ ALTER TABLE ONLY public.users
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (id);
 
+CREATE INDEX idx_blocked_users_blocked ON public.blocked_users USING btree (blocked_hash);
+
 CREATE INDEX idx_bug_reports_created ON public.bug_reports USING btree (created_at DESC);
 
 CREATE INDEX idx_bug_reports_user ON public.bug_reports USING btree (user_hash, created_at DESC);
@@ -228,13 +230,13 @@ CREATE INDEX idx_contact_invites_owner ON public.contact_invites USING btree (ow
 
 CREATE INDEX idx_conv_participants ON public.conversation_participants USING btree (user_hash);
 
-CREATE INDEX idx_groups_id ON public.groups USING btree (id);
-
 CREATE UNIQUE INDEX idx_groups_invite_code ON public.groups USING btree (invite_code) WHERE (invite_code IS NOT NULL);
 
 CREATE INDEX idx_messages_conversation ON public.messages USING btree (conversation_id, created_at);
 
-CREATE INDEX idx_messages_delivered ON public.messages USING btree (delivered_at) WHERE (delivered_at IS NULL);
+CREATE INDEX idx_messages_delivered_at ON public.messages USING btree (delivered_at) WHERE (delivered_at IS NOT NULL);
+
+CREATE INDEX idx_messages_recipient_conversation ON public.messages USING btree (recipient_hash, conversation_id, created_at);
 
 CREATE INDEX idx_messages_recipient_pending ON public.messages USING btree (recipient_hash, created_at) WHERE (delivered_at IS NULL);
 
