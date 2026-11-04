@@ -12,6 +12,9 @@ function requiredEnv(name) {
 }
 
 const PORT = process.env.PORT || 3000;
+// Domyślnie tylko pętla zwrotna (nginx na tym samym hoście). W kontenerze Docker
+// ustawiane na 0.0.0.0, a port publikowany jest wyłącznie na 127.0.0.1 hosta.
+const HOST = process.env.HOST || "127.0.0.1";
 const DB_URL = requiredEnv("DATABASE_URL");
 const JWT_SECRET = requiredEnv("JWT_SECRET");
 const TURN_SECRET = requiredEnv("TURN_SECRET");
@@ -53,6 +56,7 @@ if (!REPORTS_ADMIN_KEY || REPORTS_ADMIN_KEY.length < 24) {
 
 module.exports = {
   PORT,
+  HOST,
   DB_URL,
   JWT_SECRET,
   TURN_SECRET,

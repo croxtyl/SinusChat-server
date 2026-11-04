@@ -27,21 +27,41 @@
  * SPDX-License-Identifier: AGPL-3.0-only
  */
 
-'use strict'
+"use strict";
 
-const { PORT } = require('./src/config')
-const { buildApp } = require('./src/app')
-const { ensureSchema, migrateAvatarNames } = require('./src/db')
-const { startJobs } = require('./src/jobs')
+const { PORT, HOST } = require("./src/config");
+const { buildApp } = require("./src/app");
+const { db, ensureSchema, migrateAvatarNames } = require("./src/db");
+const { startJobs } = require("./src/jobs");
 
-const app = buildApp()
+const app = buildApp();
 
-const schemaReady = ensureSchema().then(migrateAvatarNames)
-startJobs(schemaReady)
+const schemaReady = ensureSchema().then(migrateAvatarNames);
+startJobs(schemaReady);
 
 schemaReady.finally(() => {
-  app.listen({ port: PORT, host: '127.0.0.1' }, (err) => {
-    if (err) { console.error(err); process.exit(1) }
-    console.log(`SinusChat server running on port ${PORT}`)
-  })
-})
+  app.listen({ port: PORT, host: HOST }, (err) => {
+    if (err) {
+      console.error(err);
+      process.exit(1);
+    }
+    console.log(`SinusChat server running on ${HOST}:${PORT}`);
+  });
+});
+
+let shuttingDown = false;
+for (const signal of ["SIGTERM", "SIGINT"]) {
+  process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`${signal} received, shutting down`);
+    setTimeout(() => process.exit(1), 10_000).unref();
+    app
+      .close()
+      .then(() => db.end())
+      .then(
+        () => process.exit(0),
+        () => process.exit(1),
+      );
+  });
+}
